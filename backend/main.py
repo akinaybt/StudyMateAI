@@ -1,18 +1,40 @@
+import json
 import os
 import re
 import tempfile
-import json
 import uuid
+from pathlib import Path
 
 import fitz  # pymupdf
 from docx import Document
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
-from pathlib import Path
+from pydantic import BaseModel
 from pptx import Presentation
+from supabase import Client, create_client
 
+# ── ENV ───────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing in environment variables")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+DOCUMENTS_BUCKET = os.getenv("DOCUMENTS_BUCKET", "documents")
+
+if not SUPABASE_URL:
+    raise RuntimeError("SUPABASE_URL is missing in environment variables")
+
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is missing in environment variables")
+
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# ── APP ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="StudyMate AI", version="0.1.0")
 
 app.add_middleware(
@@ -21,32 +43,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ── ENV ───────────────────────────────────────────────────────────────────────
-load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is missing in environment variables")
+# ── MODELS ───────────────────────────────────────────────────────────────────
+class BucketUploadBody(BaseModel):
+    storage_path: str
+    filename: str
+    content_type: str | None = None
 
-MAX_DOC_BYTES   = 20 * 1024 * 1024
-MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
-AUDIO_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm", ".flac"}
+# ── FILE TYPE MAPS ───────────────────────────────────────────────────────────
+EXTENSION_MAP = {
+    ".pdf": "pdf",
+    ".pptx": "pptx",
+    ".docx": "docx",
+}
 
-EXTENSION_MAP = {".pdf": "pdf", ".pptx": "pptx", ".docx": "docx"}
 CONTENT_TYPE_MAP = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
 }
 
-# ── хранилище текстов в памяти ────────────────────────────────────────────────
-# { document_id: { "filename": str, "file_type": str, "text": str } }
-storage: dict = {}
-
-
-# ── парсеры ───────────────────────────────────────────────────────────────────
-
+# ── PARSERS ──────────────────────────────────────────────────────────────────
 def _parse_pdf(path: str) -> str:
     doc = fitz.open(path)
     pages = []
@@ -60,6 +78,7 @@ def _parse_pdf(path: str) -> str:
 def _parse_pptx(path: str) -> str:
     prs = Presentation(path)
     slides = []
+
     for i, slide in enumerate(prs.slides):
         texts = [
             para.text.strip()
@@ -68,25 +87,34 @@ def _parse_pptx(path: str) -> str:
             for para in shape.text_frame.paragraphs
             if para.text.strip()
         ]
+
         if texts:
             slides.append(f"[Слайд {i + 1}]\n" + "\n".join(texts))
+
     return "\n\n".join(slides)
 
 
 def _parse_docx(path: str) -> str:
     doc = Document(path)
     parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+
     for table in doc.tables:
         for row in table.rows:
             row_text = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
             if row_text:
                 parts.append(row_text)
+
     return "\n\n".join(parts)
 
 
-PARSERS = {"pdf": _parse_pdf, "pptx": _parse_pptx, "docx": _parse_docx}
+PARSERS = {
+    "pdf": _parse_pdf,
+    "pptx": _parse_pptx,
+    "docx": _parse_docx,
+}
 
 
+# ── HELPERS ──────────────────────────────────────────────────────────────────
 def _clean(text: str) -> str:
     text = re.sub(r"\x00", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -100,10 +128,36 @@ def _resolve_doc_type(content_type: str, filename: str) -> str | None:
     return EXTENSION_MAP.get(Path(filename).suffix.lower())
 
 
-def _parse_file(data: bytes, filename: str, content_type: str) -> tuple[str, str]:
+def _extract_bearer_token(authorization: str | None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing Authorization bearer token")
+    return authorization.removeprefix("Bearer ").strip()
+
+
+def _require_user(jwt: str):
+    try:
+        response = supabase_admin.auth.get_user(jwt)
+        user = response.user
+        if not user:
+            raise HTTPException(401, "Invalid access token")
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(401, f"Unauthorized: {e}")
+
+
+def _download_from_bucket(storage_path: str) -> bytes:
+    try:
+        return supabase_admin.storage.from_(DOCUMENTS_BUCKET).download(storage_path)
+    except Exception as e:
+        raise HTTPException(404, f"File not found in bucket: {e}")
+
+
+def _parse_file_from_bytes(data: bytes, filename: str, content_type: str) -> tuple[str, str]:
     file_type = _resolve_doc_type(content_type, filename)
     if not file_type:
-        raise HTTPException(422, "Поддерживаются только PDF, PPTX, DOCX")
+        raise HTTPException(422, "Supported formats are only PDF, PPTX, DOCX")
 
     with tempfile.NamedTemporaryFile(suffix=f".{file_type}", delete=False) as tmp:
         tmp.write(data)
@@ -112,34 +166,54 @@ def _parse_file(data: bytes, filename: str, content_type: str) -> tuple[str, str
     try:
         text = _clean(PARSERS[file_type](tmp_path))
     except Exception as e:
-        raise HTTPException(500, f"Ошибка парсинга: {e}")
+        raise HTTPException(500, f"Parsing error: {e}")
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     if not text:
-        raise HTTPException(422, "Не удалось извлечь текст — документ пустой или отсканирован")
+        raise HTTPException(422, "Unable to extract text - document is empty or scanned")
 
     return text, file_type
 
 
-# ── AI helpers ────────────────────────────────────────────────────────────────
+def _get_document_row(document_id: str):
+    try:
+        response = (
+            supabase_admin.table("documents")
+            .select("id, user_id, file_name, file_type, storage_path, created_at")
+            .eq("id", document_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Database query failed: {e}")
+
+    data = getattr(response, "data", None)
+    if not data:
+        raise HTTPException(404, "Document not found")
+
+    return data
+
 
 def _generate_summary(text: str) -> str:
-    prompt = f"""Ты — учебный ассистент. Проанализируй материал и создай структурированный конспект:
+    prompt = f"""You are a study assistant. Analyze the material and create a structured summary:
 
-## 📌 Тема
-Одно предложение — о чём этот материал.
+## Topic
+One sentence about what this material is about.
 
-## 🔑 Ключевые тезисы
-5-7 самых важных пунктов (каждый 1-2 предложения).
+## Key points
+5-7 most important points, each 1-2 sentences.
 
-## 📝 Резюме
-Краткое резюме в 3-4 предложения.
+## Summary
+A short summary in 3-4 sentences.
 
-## ❓ Вопросы для самопроверки
-3 вопроса по материалу.
+## Self-check questions
+3 questions based on the material.
 
-Материал:
+Material:
 {text[:12000]}"""
 
     client = Groq(api_key=GROQ_API_KEY)
@@ -151,12 +225,12 @@ def _generate_summary(text: str) -> str:
 
 
 def _generate_flashcards(text: str) -> list:
-    prompt = f"""Ты — учебный ассистент. Создай 10 флэшкарточек по материалу.
+    prompt = f"""You are a study assistant. Create 10 flashcards based on the material.
 
-Ответь СТРОГО в формате JSON, без markdown, без пояснений:
-{{"flashcards": [{{"front": "Вопрос или термин", "back": "Ответ или определение"}}]}}
+Respond STRICTLY in JSON format, without markdown or explanations:
+{{"flashcards": [{{"front": "Question or term", "back": "Answer or definition"}}]}}
 
-Материал:
+Material:
 {text[:10000]}"""
 
     client = Groq(api_key=GROQ_API_KEY)
@@ -169,159 +243,157 @@ def _generate_flashcards(text: str) -> list:
     return parsed.get("flashcards", [])
 
 
-def _transcribe_audio(data: bytes, filename: str) -> str:
-    suffix = Path(filename).suffix.lower() or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        with open(tmp_path, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                file=(filename, audio_file),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-            )
-        return transcription if isinstance(transcription, str) else transcription.text
-    except Exception as e:
-        raise HTTPException(500, f"Ошибка транскрипции: {e}")
-    finally:
-        os.unlink(tmp_path)
-
-
-# ── эндпоинты ─────────────────────────────────────────────────────────────────
-
+# ── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# ШАГ 1 — загрузка документа, возвращает document_id
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
-    """Загружает документ, парсит текст, сохраняет в памяти. Возвращает document_id."""
-    data = await file.read()
-    if len(data) > MAX_DOC_BYTES:
-        raise HTTPException(413, "Файл больше 20 МБ")
+async def upload(
+        payload: BucketUploadBody,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    """
+    Bucket-first flow:
+    - Flutter uploads file to Supabase Storage
+    - Flutter sends storage_path + filename + content_type here
+    - Backend verifies user token, downloads file from bucket, parses text
+    - Backend stores document metadata in Postgres
+    """
+    jwt = _extract_bearer_token(authorization)
+    user = _require_user(jwt)
 
-    text, file_type = _parse_file(data, file.filename or "", file.content_type or "")
+    if not payload.storage_path.strip():
+        raise HTTPException(422, "storage_path is required")
 
-    doc_id = str(uuid.uuid4())
-    storage[doc_id] = {
-        "filename": file.filename,
-        "file_type": file_type,
-        "text": text,
-    }
+    data = _download_from_bucket(payload.storage_path)
+    text, file_type = _parse_file_from_bytes(
+        data=data,
+        filename=payload.filename,
+        content_type=payload.content_type or "",
+    )
+
+    document_id = str(uuid.uuid4())
+
+    try:
+        supabase_admin.table("documents").insert(
+            {
+                "id": document_id,
+                "user_id": user.id,
+                "storage_path": payload.storage_path,
+                "file_name": payload.filename,
+                "file_type": file_type,
+            }
+        ).execute()
+    except Exception as e:
+        raise HTTPException(500, f"Database insert failed: {e}")
 
     return {
-        "document_id": doc_id,
-        "filename": file.filename,
+        "document_id": document_id,
+        "user_id": user.id,
+        "filename": payload.filename,
         "file_type": file_type,
         "char_count": len(text),
         "preview": text[:500],
+        "storage_path": payload.storage_path,
     }
 
 
-# ШАГ 2а — summary по document_id
 @app.post("/api/summary/{document_id}")
-async def summary(document_id: str):
-    """Генерирует конспект по уже загруженному документу."""
-    doc = storage.get(document_id)
-    if not doc:
-        raise HTTPException(404, "Документ не найден. Сначала загрузи файл через /api/upload")
+async def summary(
+        document_id: str,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    jwt = _extract_bearer_token(authorization)
+    user = _require_user(jwt)
+
+    doc = _get_document_row(document_id)
+    if doc["user_id"] != user.id:
+        raise HTTPException(403, "You do not have access to this document")
+
+    data = _download_from_bucket(doc["storage_path"])
+    text, _ = _parse_file_from_bytes(
+        data=data,
+        filename=doc["file_name"],
+        content_type="",
+    )
 
     try:
-        summary_text = _generate_summary(doc["text"])
+        summary_text = _generate_summary(text)
     except Exception as e:
-        raise HTTPException(500, f"Ошибка Groq API: {e}")
+        raise HTTPException(500, f"Error generating summary: {e}")
+
+    try:
+        supabase_admin.table("summaries").insert(
+            {
+                "document_id": document_id,
+                "summary_text": summary_text,
+            }
+        ).execute()
+    except Exception:
+        pass
 
     return {
         "document_id": document_id,
-        "filename": doc["filename"],
+        "file_name": doc["file_name"],
         "summary": summary_text,
     }
 
 
-# ШАГ 2б — flashcards по document_id
 @app.post("/api/flashcards/{document_id}")
-async def flashcards(document_id: str):
-    """Генерирует флэшкарточки по уже загруженному документу."""
-    doc = storage.get(document_id)
-    if not doc:
-        raise HTTPException(404, "Документ не найден. Сначала загрузи файл через /api/upload")
+async def flashcards(
+        document_id: str,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    jwt = _extract_bearer_token(authorization)
+    user = _require_user(jwt)
+
+    doc = _get_document_row(document_id)
+    if doc["user_id"] != user.id:
+        raise HTTPException(403, "You do not have access to this document")
+
+    data = _download_from_bucket(doc["storage_path"])
+    text, _ = _parse_file_from_bytes(
+        data=data,
+        filename=doc["file_name"],
+        content_type="",
+    )
 
     try:
-        cards = _generate_flashcards(doc["text"])
+        cards = _generate_flashcards(text)
     except Exception as e:
-        raise HTTPException(500, f"Ошибка Groq API: {e}")
+        raise HTTPException(500, f"Error generating flashcards: {e}")
+
+    rows = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+
+        question = str(card.get("front", "")).strip()
+        answer = str(card.get("back", "")).strip()
+
+        if not question and not answer:
+            continue
+
+        rows.append(
+            {
+                "id": str(uuid.uuid4()),
+                "document_id": document_id,
+                "question": question,
+                "answer": answer,
+            }
+        )
+
+    try:
+        if rows:
+            supabase_admin.table("flashcards").insert(rows).execute()
+    except Exception as e:
+        raise HTTPException(500, f"Database insert failed: {e}")
 
     return {
         "document_id": document_id,
-        "filename": doc["filename"],
-        "count": len(cards),
-        "flashcards": cards,
-    }
-
-
-# ── аудио лекции ──────────────────────────────────────────────────────────────
-
-@app.post("/api/lecture/transcribe")
-async def lecture_transcribe(file: UploadFile = File(...)):
-    """Загружает аудио лекции и возвращает транскрипцию + document_id для дальнейшей обработки."""
-    data = await file.read()
-    if len(data) > MAX_AUDIO_BYTES:
-        raise HTTPException(413, "Аудиофайл больше 25 МБ")
-
-    filename = file.filename or "audio.wav"
-    if Path(filename).suffix.lower() not in AUDIO_EXTENSIONS:
-        raise HTTPException(422, f"Поддерживаются: {', '.join(AUDIO_EXTENSIONS)}")
-
-    transcript = _transcribe_audio(data, filename)
-    if not transcript.strip():
-        raise HTTPException(422, "Не удалось распознать речь")
-
-    # сохраняем транскрипт так же как документ — можно потом вызвать /api/summary/{id}
-    doc_id = str(uuid.uuid4())
-    storage[doc_id] = {
-        "filename": filename,
-        "file_type": "audio",
-        "text": transcript,
-    }
-
-    return {
-        "document_id": doc_id,
-        "filename": filename,
-        "char_count": len(transcript),
-        "transcript": transcript,
-    }
-
-
-@app.post("/api/lecture/summary")
-async def lecture_summary(file: UploadFile = File(...)):
-    """Загружает аудио → транскрипция → конспект. Всё в одном запросе."""
-    data = await file.read()
-    if len(data) > MAX_AUDIO_BYTES:
-        raise HTTPException(413, "Аудиофайл больше 25 МБ")
-
-    filename = file.filename or "audio.wav"
-    if Path(filename).suffix.lower() not in AUDIO_EXTENSIONS:
-        raise HTTPException(422, f"Поддерживаются: {', '.join(AUDIO_EXTENSIONS)}")
-
-    transcript = _transcribe_audio(data, filename)
-    if not transcript.strip():
-        raise HTTPException(422, "Не удалось распознать речь")
-
-    doc_id = str(uuid.uuid4())
-    storage[doc_id] = {"filename": filename, "file_type": "audio", "text": transcript}
-
-    try:
-        summary_text = _generate_summary(transcript)
-    except Exception as e:
-        raise HTTPException(500, f"Ошибка генерации конспекта: {e}")
-
-    return {
-        "document_id": doc_id,
-        "filename": filename,
-        "transcript": transcript,
-        "summary": summary_text,
+        "file_name": doc["file_name"],
+        "count": len(rows),
+        "flashcards": rows,
     }

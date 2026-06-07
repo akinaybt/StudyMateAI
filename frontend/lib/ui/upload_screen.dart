@@ -2,7 +2,10 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '_ui.dart';
+import '../services/api_service.dart';
 
 class UploadScreen extends StatefulWidget {
   final VoidCallback onBack;
@@ -15,12 +18,82 @@ class UploadScreen extends StatefulWidget {
 enum UploadActionView { none, summary, quiz }
 
 class _UploadScreenState extends State<UploadScreen> {
+  static const String _bucketName = 'documents';
+
+  final SupabaseClient _supabase = Supabase.instance.client;
+  final ApiService _apiService = const ApiService();
+
   PlatformFile? _picked;
   bool _loading = false;
 
   UploadActionView _view = UploadActionView.none;
   String? _summaryText;
   String? _quizText;
+  String? _storagePath;
+  String? _documentId;
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  String _contentTypeForFile(String fileName) {
+    final extension = fileName.split('.').last.toLowerCase();
+    switch (extension) {
+      case 'pdf':
+        return 'application/pdf';
+      case 'pptx':
+        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      case 'docx':
+        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      default:
+        throw Exception('Unsupported file type: $extension');
+    }
+  }
+
+  Future<void> _uploadToBucket() async {
+    final picked = _picked;
+    if (picked == null) return;
+
+    final user = _supabase.auth.currentUser;
+    if (user == null) {
+      _showMessage('Please log in before uploading files.');
+      return;
+    }
+
+    final path = picked.path;
+    if (path == null || path.isEmpty) {
+      _showMessage('This file cannot be uploaded because its path is missing.');
+      return;
+    }
+
+    final file = File(path);
+    final storagePath =
+        '${user.id}/${DateTime.now().millisecondsSinceEpoch}_${picked.name}';
+
+    await _supabase.storage.from(_bucketName).upload(
+      storagePath,
+      file,
+      fileOptions: const FileOptions(
+        cacheControl: '3600',
+        upsert: false,
+      ),
+    );
+
+    final backendResponse = await _apiService.uploadDocument(
+      storagePath: storagePath,
+      fileName: picked.name,
+      contentType: _contentTypeForFile(picked.name),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _storagePath = storagePath;
+      _documentId = backendResponse['document_id']?.toString();
+    });
+  }
 
   Future<void> _pickFile() async {
     try {
@@ -29,80 +102,124 @@ class _UploadScreenState extends State<UploadScreen> {
         _view = UploadActionView.none;
         _summaryText = null;
         _quizText = null;
+        _storagePath = null;
+        _documentId = null;
       });
 
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: false,
         withData: false,
         type: FileType.custom,
-        allowedExtensions: ['pdf', 'doc', 'docx', 'ppt', 'pptx', 'txt'],
+        allowedExtensions: ['pdf', 'docx', 'pptx'],
       );
 
       if (!mounted) return;
 
       if (result == null || result.files.isEmpty) {
         setState(() => _loading = false);
-        return; // user cancelled
+        return;
       }
 
+      final selectedFile = result.files.first;
+
       setState(() {
-        _picked = result.files.first;
-        _loading = false;
+        _picked = selectedFile;
       });
 
-      // If you need an actual "upload to server", we can do it here.
-      // For now, "uploaded" == "selected on device".
+      await _uploadToBucket();
+
+      if (!mounted) return;
+      setState(() => _loading = false);
+
+      _showMessage('File uploaded to cloud storage.');
+    } on StorageException catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+
+      _showMessage('Supabase upload failed: ${e.message}');
+    } on Exception catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+
+      _showMessage('Failed to upload document: $e');
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to pick file: $e')),
-      );
+      _showMessage('Failed to pick or upload file: $e');
     }
   }
 
   Future<void> _generateSummary() async {
-    if (_picked == null) return;
+    final documentId = _documentId;
+    if (_picked == null || documentId == null) {
+      _showMessage('Please upload a supported document first.');
+      return;
+    }
 
     setState(() {
       _loading = true;
       _view = UploadActionView.summary;
     });
 
-    // MOCK: replace later with backend call.
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    try {
+      final result = await _apiService.getSummary(documentId);
 
-    setState(() {
-      _summaryText =
-      'Summary for "${_picked!.name}"\n\n'
-          '- Main topic: Artificial Intelligence basics\n'
-          '- Key ideas: learning, reasoning, neural networks\n'
-          '- Takeaway: AI is a broad field; ML is a subset\n';
-      _loading = false;
-    });
+      if (!mounted) return;
+      setState(() {
+        _summaryText = result['summary']?.toString() ?? 'No summary returned.';
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      _showMessage('Summary generation failed: $e');
+    }
   }
 
   Future<void> _generateQuiz() async {
-    if (_picked == null) return;
+    final documentId = _documentId;
+    if (_picked == null || documentId == null) {
+      _showMessage('Please upload a supported document first.');
+      return;
+    }
 
     setState(() {
       _loading = true;
       _view = UploadActionView.quiz;
     });
 
-    // MOCK: replace later with backend call.
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    try {
+      final result = await _apiService.getFlashcards(documentId);
+      final cards = (result['flashcards'] as List<dynamic>?) ?? const [];
+      final buffer = StringBuffer();
 
-    setState(() {
-      _quizText =
-      'Practice Questions for "${_picked!.name}"\n\n'
-          '1) Define Artificial Intelligence.\n'
-          '2) What is the difference between AI and Machine Learning?\n'
-          '3) Name 3 types of Machine Learning.\n'
-          '4) What is a neural network?\n';
-      _loading = false;
-    });
+      buffer.writeln('Practice Questions for "${_picked!.name}"');
+      buffer.writeln();
+
+      for (final card in cards) {
+        if (card is Map<String, dynamic>) {
+          final question = card['question']?.toString() ?? '';
+          final answer = card['answer']?.toString() ?? '';
+          if (question.isEmpty && answer.isEmpty) continue;
+          buffer.writeln('- Q: $question');
+          buffer.writeln('  A: $answer');
+          buffer.writeln();
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _quizText = buffer.toString().trim().isEmpty
+            ? 'No flashcards returned.'
+            : buffer.toString().trim();
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      _showMessage('Flashcards generation failed: $e');
+    }
   }
 
   @override
@@ -117,7 +234,6 @@ class _UploadScreenState extends State<UploadScreen> {
           icon: const Icon(Icons.chevron_left),
           label: const Text('Back'),
         ),
-
         GlassCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -136,14 +252,29 @@ class _UploadScreenState extends State<UploadScreen> {
                 style: TextStyle(color: Color(0xFF6B7280)),
               ),
               const SizedBox(height: 16),
-
-              // Clickable upload area
-              _UploadArea(
-                loading: _loading,
-                fileName: _picked?.name,
-                onTap: _loading ? null : _pickFile,
+              Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: _UploadArea(
+                      loading: _loading,
+                      fileName: _picked?.name,
+                      onTap: _loading ? null : _pickFile,
+                    ),
+                  ),
+                ),
               ),
-
+              if (_storagePath != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  'Uploaded to bucket: $_storagePath',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF6B7280),
+                  ),
+                ),
+              ],
               if (hasFile) ...[
                 const SizedBox(height: 14),
                 Row(
@@ -186,17 +317,14 @@ class _UploadScreenState extends State<UploadScreen> {
                   ],
                 ),
               ],
-
               if (_loading) ...[
                 const SizedBox(height: 14),
                 const Center(child: CircularProgressIndicator()),
               ],
-
               if (_view == UploadActionView.summary && _summaryText != null) ...[
                 const SizedBox(height: 14),
                 _ResultBox(title: 'Summary', text: _summaryText!),
               ],
-
               if (_view == UploadActionView.quiz && _quizText != null) ...[
                 const SizedBox(height: 14),
                 _ResultBox(title: 'Practice Questions', text: _quizText!),
@@ -204,7 +332,6 @@ class _UploadScreenState extends State<UploadScreen> {
             ],
           ),
         ),
-
         const SizedBox(height: 14),
         GlassCard(
           child: Column(
