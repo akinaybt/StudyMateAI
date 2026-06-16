@@ -7,4 +7,5 @@ class ApiConfig {
   static String get uploadEndpoint => '$baseUrl/upload';
   static String get summaryEndpoint => '$baseUrl/summary';
   static String get flashcardsEndpoint => '$baseUrl/flashcards';
+  static String get lectureSummaryEndpoint => '$baseUrl/lecture-summary';
 }
