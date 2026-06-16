@@ -397,3 +397,62 @@ async def flashcards(
         "count": len(rows),
         "flashcards": rows,
     }
+
+def _transcribe_audio(data: bytes, filename: str) -> str:
+    suffix = Path(filename).suffix.lower() or ".m4a"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+
+        with open(tmp_path, "rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                file=(filename, audio_file.read()),
+                model="whisper-large-v3-turbo",
+                response_format="json",
+            )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    text = getattr(response, "text", None) or ""
+    text = _clean(text)
+
+    if not text:
+        raise HTTPException(422, "Unable to transcribe audio")
+
+    return text
+
+@app.post("/api/lecture-summary")
+async def lecture_summary(
+        payload: BucketUploadBody,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    jwt = _extract_bearer_token(authorization)
+    user = _require_user(jwt)
+
+    if not payload.storage_path.strip():
+        raise HTTPException(422, "storage_path is required")
+
+    data = _download_from_bucket(payload.storage_path)
+
+    try:
+        transcript = _transcribe_audio(data, payload.filename)
+        summary_text = _generate_summary(transcript)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Lecture summary failed: {e}")
+
+    return {
+        "user_id": user.id,
+        "filename": payload.filename,
+        "storage_path": payload.storage_path,
+        "transcript": transcript,
+        "summary": summary_text,
+    }
