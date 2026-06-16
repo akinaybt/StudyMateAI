@@ -36,6 +36,8 @@ dependencies:
   cupertino_icons: ^1.0.8
   supabase_flutter: ^2.12.4
   file_picker: ^8.0.0
+  record: ^6.0.0
+  path_provider: ^2.1.5
   http: ^1.2.2
 
 dev_dependencies:
