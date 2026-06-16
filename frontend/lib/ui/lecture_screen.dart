@@ -1,8 +1,16 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '_ui.dart';
+import '../services/api_service.dart';
 
 class LectureScreen extends StatefulWidget {
   final VoidCallback onBack;
+
   const LectureScreen({super.key, required this.onBack});
 
   @override
@@ -10,7 +18,129 @@ class LectureScreen extends StatefulWidget {
 }
 
 class _LectureScreenState extends State<LectureScreen> {
+  static const String _bucketName = 'documents';
+
+  final SupabaseClient _supabase = Supabase.instance.client;
+  final ApiService _apiService = const ApiService();
+  final AudioRecorder _recorder = AudioRecorder();
+
   bool _recording = false;
+  bool _loading = false;
+
+  String? _recordingPath;
+  String? _summary;
+  String? _transcript;
+
+  @override
+  void dispose() {
+    _recorder.dispose();
+    super.dispose();
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<void> _startRecording() async {
+    final hasPermission = await _recorder.hasPermission();
+
+    if (!hasPermission) {
+      _showMessage('Microphone permission is required.');
+      return;
+    }
+
+    final dir = await getTemporaryDirectory();
+    final path =
+        '${dir.path}/lecture_${DateTime.now().millisecondsSinceEpoch}.m4a';
+
+    await _recorder.start(
+      const RecordConfig(
+        encoder: AudioEncoder.aacLc,
+        bitRate: 128000,
+        sampleRate: 44100,
+      ),
+      path: path,
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      _recording = true;
+      _recordingPath = path;
+      _summary = null;
+      _transcript = null;
+    });
+  }
+
+  Future<void> _stopRecordAndSummarize() async {
+    final user = _supabase.auth.currentUser;
+
+    if (user == null) {
+      _showMessage('Please log in first.');
+      return;
+    }
+
+    setState(() {
+      _recording = false;
+      _loading = true;
+    });
+
+    try {
+      final path = await _recorder.stop();
+
+      if (path == null || path.isEmpty) {
+        throw Exception('Recording file was not created.');
+      }
+
+      final file = File(path);
+      final fileName = 'lecture_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      final storagePath = '${user.id}/lectures/$fileName';
+
+      await _supabase.storage.from(_bucketName).upload(
+        storagePath,
+        file,
+        fileOptions: const FileOptions(
+          cacheControl: '3600',
+          upsert: false,
+          contentType: 'audio/m4a',
+        ),
+      );
+
+      final result = await _apiService.getLectureSummary(
+        storagePath: storagePath,
+        fileName: fileName,
+        contentType: 'audio/m4a',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _summary = result['summary']?.toString() ?? 'No summary returned.';
+        _transcript = result['transcript']?.toString();
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() => _loading = false);
+      _showMessage('Could not summarize lecture: $e');
+    }
+  }
+
+  Future<void> _handleRecordButton() async {
+    if (_loading) return;
+
+    if (_recording) {
+      await _stopRecordAndSummarize();
+    } else {
+      await _startRecording();
+    }
+
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -26,11 +156,20 @@ class _LectureScreenState extends State<LectureScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Live Lecture Capture', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: Color(0xFF1F2937))),
+              const Text(
+                'Lecture Summary',
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                  color: Color(0xFF1F2937),
+                ),
+              ),
               const SizedBox(height: 6),
-              const Text('Real-time transcription and intelligent summarization', style: TextStyle(color: Color(0xFF6B7280))),
+              const Text(
+                'Record your lecture, then generate a summary',
+                style: TextStyle(color: Color(0xFF6B7280)),
+              ),
               const SizedBox(height: 16),
-
               Center(
                 child: Column(
                   children: [
@@ -48,59 +187,50 @@ class _LectureScreenState extends State<LectureScreen> {
                               : const [Color(0xFFC084FC), Color(0xFF6366F1)],
                         ),
                       ),
-                      child: const Icon(Icons.mic, size: 56, color: Colors.white),
+                      child: Icon(
+                        _recording ? Icons.stop : Icons.mic,
+                        size: 56,
+                        color: Colors.white,
+                      ),
                     ),
                     const SizedBox(height: 16),
                     ElevatedButton.icon(
-                      onPressed: () => setState(() => _recording = !_recording),
-                      icon: Icon(_recording ? Icons.stop : Icons.play_arrow),
+                      onPressed: _loading ? null : _handleRecordButton,
+                      icon: Icon(_recording ? Icons.stop : Icons.mic),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: _recording ? const Color(0xFFEF4444) : const Color(0xFF4F46E5),
+                        backgroundColor: _recording
+                            ? const Color(0xFFEF4444)
+                            : const Color(0xFF4F46E5),
                         foregroundColor: Colors.white,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
-                        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 22,
+                          vertical: 12,
+                        ),
                       ),
-                      label: Text(_recording ? 'Stop Recording' : 'Start Recording'),
+                      label: Text(
+                        _recording ? 'Stop & Summarize' : 'Start Recording',
+                      ),
                     ),
-                    if (_recording) ...[
+                    if (_loading) ...[
                       const SizedBox(height: 14),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFEEF2FF),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: const Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('Live Transcription:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Color(0xFF374151))),
-                            SizedBox(height: 6),
-                            Text(
-                              '"Today we\'re going to discuss artificial intelligence and its applications in modern computing..."',
-                              style: TextStyle(fontSize: 12, color: Color(0xFF6B7280), fontStyle: FontStyle.italic),
-                            ),
-                          ],
-                        ),
-                      ),
+                      const CircularProgressIndicator(),
+                      const SizedBox(height: 8),
+                      const Text('Transcribing and summarizing...'),
                     ],
                   ],
                 ),
               ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 14),
-        const GlassCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Features', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Color(0xFF1F2937))),
-              SizedBox(height: 10),
-              _Dot(text: 'Real-time speech transcription'),
-              _Dot(text: 'Automatic summarization'),
-              _Dot(text: 'Key points extraction'),
-              _Dot(text: 'Save & review later'),
+              if (_summary != null) ...[
+                const SizedBox(height: 18),
+                _ResultBox(title: 'Summary', text: _summary!),
+              ],
+              if (_transcript != null) ...[
+                const SizedBox(height: 12),
+                _ResultBox(title: 'Transcript', text: _transcript!),
+              ],
             ],
           ),
         ),
@@ -109,21 +239,36 @@ class _LectureScreenState extends State<LectureScreen> {
   }
 }
 
-class _Dot extends StatelessWidget {
+class _ResultBox extends StatelessWidget {
+  final String title;
   final String text;
-  const _Dot({required this.text});
+
+  const _ResultBox({
+    required this.title,
+    required this.text,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFEEF2FF),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFC7D2FE).withOpacity(0.55),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(width: 6, height: 6, decoration: const BoxDecoration(color: Color(0xFF4F46E5), shape: BoxShape.circle)),
-          const SizedBox(width: 10),
-          Expanded(child: Text(text, style: const TextStyle(fontSize: 13, color: Color(0xFF374151)))),
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 8),
+          Text(text, style: const TextStyle(height: 1.35)),
         ],
       ),
     );
   }
+
 }
