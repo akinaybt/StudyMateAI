@@ -122,4 +122,28 @@ class ApiService {
       throw Exception('Flashcards error: $e');
     }
   }
+
+  Future<Map<String, dynamic>> getLectureSummary({
+    required String storagePath,
+    required String fileName,
+    required String contentType,
+  }) async {
+    try {
+      final headers = await _jsonHeaders();
+
+      final response = await http.post(
+        Uri.parse(ApiConfig.lectureSummaryEndpoint),
+        headers: headers,
+        body: jsonEncode({
+          'storage_path': storagePath,
+          'filename': fileName,
+          'content_type': contentType,
+        }),
+      );
+
+      return _decodeJsonResponse(response, 'Lecture summary');
+    } catch (e) {
+      throw Exception('Lecture summary error: $e');
+    }
+  }
 }
