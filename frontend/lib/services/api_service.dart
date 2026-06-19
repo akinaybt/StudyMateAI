@@ -45,15 +45,15 @@ class ApiService {
     return headers;
   }
 
-  Map<String, dynamic> _decodeJsonResponse(
-      http.Response response,
-      String action,
-      ) {
+  Map<String, dynamic> _decodeJsonResponse(http.Response response,
+      String action,) {
     final body = response.body.trim();
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
-        '$action failed (${response.statusCode}): ${body.isEmpty ? 'Empty response body' : body}',
+        '$action failed (${response.statusCode}): ${body.isEmpty
+            ? 'Empty response body'
+            : body}',
       );
     }
 
@@ -132,7 +132,7 @@ class ApiService {
       final headers = await _jsonHeaders();
 
       final response = await http.post(
-        Uri.parse(ApiConfig.lectureSummaryEndpoint),
+        Uri.parse(ApiConfig.lectureAudioSummaryEndpoint),
         headers: headers,
         body: jsonEncode({
           'storage_path': storagePath,

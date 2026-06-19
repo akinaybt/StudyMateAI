@@ -50,6 +50,8 @@ class BucketUploadBody(BaseModel):
     filename: str
     content_type: str | None = None
 
+class TranscriptCreateBody(BaseModel):
+    transcript_text: str
 
 # ── FILE TYPE MAPS ───────────────────────────────────────────────────────────
 EXTENSION_MAP = {
@@ -242,6 +244,23 @@ Material:
     parsed = json.loads(response.choices[0].message.content)
     return parsed.get("flashcards", [])
 
+def _get_transcript_row(transcript_id: str):
+    try:
+        response = (
+            supabase_admin.table("transcripts")
+            .select("id, transcript_text, created_at")
+            .eq("id", transcript_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Database query failed: {e}")
+
+    data = getattr(response, "data", None)
+    if not data:
+        raise HTTPException(404, "Transcript not found")
+
+    return data
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -449,10 +468,32 @@ async def lecture_summary(
     except Exception as e:
         raise HTTPException(500, f"Lecture summary failed: {e}")
 
+    transcript_id = str(uuid.uuid4())
+    summary_id = str(uuid.uuid4())
+
+    try:
+        supabase_admin.table("transcripts").insert(
+            {
+                "id": transcript_id,
+                "transcript_text": transcript,
+            }
+        ).execute()
+
+        supabase_admin.table("transcript_summaries").insert(
+            {
+                "id": summary_id,
+                "transcript_id": transcript_id,
+                "summary_text": summary_text,
+            }
+        ).execute()
+    except Exception as e:
+        raise HTTPException(500, f"Database insert failed: {e}")
+
     return {
         "user_id": user.id,
         "filename": payload.filename,
         "storage_path": payload.storage_path,
+        "transcript_id": transcript_id,
         "transcript": transcript,
         "summary": summary_text,
     }
