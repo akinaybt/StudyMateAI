@@ -27,6 +27,12 @@ class _StudyMateAppState extends State<StudyMateApp> {
   AppTab _tab = AppTab.home;
   AppGateState _gateState = AppGateState.auth;
 
+  String? _uploadedDocumentName;
+  DateTime? _uploadedDocumentAt;
+  int _practiceCardCount = 0;
+  String? _lectureActivityTitle;
+  DateTime? _lectureActivityAt;
+
   static const _bgGradient = LinearGradient(
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
@@ -103,6 +109,26 @@ class _StudyMateAppState extends State<StudyMateApp> {
 
   void _go(AppTab tab) => setState(() => _tab = tab);
 
+  void _handleDocumentUploaded(String fileName) {
+    setState(() {
+      _uploadedDocumentName = fileName;
+      _uploadedDocumentAt = DateTime.now();
+    });
+  }
+
+  void _handleFlashcardsGenerated(int count) {
+    setState(() {
+      _practiceCardCount = count;
+    });
+  }
+
+  void _handleLectureSummaryGenerated() {
+    setState(() {
+      _lectureActivityTitle = 'Lecture Summary';
+      _lectureActivityAt = DateTime.now();
+    });
+  }
+
   void _handleLoggedIn() {
     if (!mounted) return;
 
@@ -169,15 +195,29 @@ class _StudyMateAppState extends State<StudyMateApp> {
       );
     }
 
-    final Widget body = switch (_tab) {
-      AppTab.home => HomeScreen(onNavigate: _go),
-      AppTab.upload => UploadScreen(onBack: () => _go(AppTab.home)),
-      AppTab.cards => CardsScreen(onBack: () => _go(AppTab.home)),
-      AppTab.lecture => LectureScreen(onBack: () => _go(AppTab.home)),
-      AppTab.account => AccountScreen(
+    final pages = [
+      HomeScreen(
+        onNavigate: _go,
+        uploadedDocumentName: _uploadedDocumentName,
+        uploadedDocumentAt: _uploadedDocumentAt,
+        practiceCardCount: _practiceCardCount,
+        lectureActivityTitle: _lectureActivityTitle,
+        lectureActivityAt: _lectureActivityAt,
+      ),
+      UploadScreen(
+        onBack: () => _go(AppTab.home),
+        onDocumentUploaded: _handleDocumentUploaded,
+        onFlashcardsGenerated: _handleFlashcardsGenerated,
+      ),
+      CardsScreen(onBack: () => _go(AppTab.home)),
+      LectureScreen(
+        onBack: () => _go(AppTab.home),
+        onSummaryGenerated: _handleLectureSummaryGenerated,
+      ),
+      AccountScreen(
         onLogout: _handleLogout,
       ),
-    };
+    ];
 
     return DecoratedBox(
       decoration: const BoxDecoration(gradient: _bgGradient),
@@ -187,7 +227,12 @@ class _StudyMateAppState extends State<StudyMateApp> {
           child: Column(
             children: [
               const _Header(),
-              Expanded(child: body),
+              Expanded(
+                child: IndexedStack(
+                  index: AppTab.values.indexOf(_tab),
+                  children: pages,
+                ),
+              ),
             ],
           ),
         ),

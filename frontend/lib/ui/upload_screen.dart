@@ -9,7 +9,15 @@ import '../services/api_service.dart';
 
 class UploadScreen extends StatefulWidget {
   final VoidCallback onBack;
-  const UploadScreen({super.key, required this.onBack});
+  final ValueChanged<String> onDocumentUploaded;
+  final ValueChanged<int> onFlashcardsGenerated;
+
+  const UploadScreen({
+    super.key,
+    required this.onBack,
+    required this.onDocumentUploaded,
+    required this.onFlashcardsGenerated,
+  });
 
   @override
   State<UploadScreen> createState() => _UploadScreenState();
@@ -93,6 +101,8 @@ class _UploadScreenState extends State<UploadScreen> {
       _storagePath = storagePath;
       _documentId = backendResponse['document_id']?.toString();
     });
+
+    widget.onDocumentUploaded(picked.name);
   }
 
   Future<void> _pickFile() async {
@@ -160,6 +170,7 @@ class _UploadScreenState extends State<UploadScreen> {
     setState(() {
       _loading = true;
       _view = UploadActionView.summary;
+      _summaryText = null;
     });
 
     try {
@@ -192,6 +203,9 @@ class _UploadScreenState extends State<UploadScreen> {
     try {
       final result = await _apiService.getFlashcards(documentId);
       final cards = (result['flashcards'] as List<dynamic>?) ?? const [];
+
+      widget.onFlashcardsGenerated(cards.length);
+
       final buffer = StringBuffer();
 
       buffer.writeln('Practice Questions for "${_picked!.name}"');
@@ -324,6 +338,26 @@ class _UploadScreenState extends State<UploadScreen> {
               if (_view == UploadActionView.summary && _summaryText != null) ...[
                 const SizedBox(height: 14),
                 _ResultBox(title: 'Summary', text: _summaryText!),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: _loading ? null : _pickFile,
+                    icon: const Icon(Icons.upload_file),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      side: const BorderSide(color: Color(0xFFC7D2FE)),
+                      foregroundColor: const Color(0xFF4F46E5),
+                    ),
+                    label: const Text(
+                      'Upload new document',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ),
               ],
               if (_view == UploadActionView.quiz && _quizText != null) ...[
                 const SizedBox(height: 14),

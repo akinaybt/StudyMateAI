@@ -4,7 +4,32 @@ import '_ui.dart';
 
 class HomeScreen extends StatelessWidget {
   final void Function(AppTab) onNavigate;
-  const HomeScreen({super.key, required this.onNavigate});
+  final String? uploadedDocumentName;
+  final DateTime? uploadedDocumentAt;
+  final int practiceCardCount;
+  final String? lectureActivityTitle;
+  final DateTime? lectureActivityAt;
+
+  const HomeScreen({
+    super.key,
+    required this.onNavigate,
+    this.uploadedDocumentName,
+    this.uploadedDocumentAt,
+    this.practiceCardCount = 0,
+    this.lectureActivityTitle,
+    this.lectureActivityAt,
+  });
+
+  String _relativeTime(DateTime? date) {
+    if (date == null) return '';
+
+    final diff = DateTime.now().difference(date);
+
+    if (diff.inMinutes < 1) return 'Just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
+    if (diff.inHours < 24) return '${diff.inHours} hours ago';
+    return '${diff.inDays} days ago';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -77,11 +102,23 @@ class HomeScreen extends StatelessWidget {
                 ),
                 child: Column(
                   children: [
-                    const Icon(Icons.credit_card, size: 42, color: Color(0xFF4F46E5)),
+                    const Icon(Icons.style, size: 42, color: Color(0xFF4F46E5)),
                     const SizedBox(height: 8),
-                    const Text('4', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: Color(0xFF1F2937))),
+                    Text(
+                      '$practiceCardCount',
+                      style: const TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF1F2937),
+                      ),
+                    ),
                     const SizedBox(height: 2),
-                    const Text('Cards ready to study', style: TextStyle(color: Color(0xFF6B7280))),
+                    Text(
+                      practiceCardCount == 0
+                          ? 'No cards generated yet'
+                          : 'Cards ready to study',
+                      style: const TextStyle(color: Color(0xFF6B7280)),
+                    ),
                     const SizedBox(height: 10),
                     ElevatedButton(
                       onPressed: () => onNavigate(AppTab.cards),
@@ -106,11 +143,20 @@ class HomeScreen extends StatelessWidget {
             children: [
               const Text('Recent Activity', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Color(0xFF1F2937))),
               const SizedBox(height: 10),
+              if (uploadedDocumentName == null && lectureActivityTitle == null)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    'No recent activity yet',
+                    style: TextStyle(color: Color(0xFF6B7280)),
+                  ),
+                ),
               ...[
-                ('Introduction to AI.pdf', true, '2 hours ago'),
-                ('Machine Learning Lecture', false, 'Yesterday'),
-                ('Neural Networks Notes.pdf', true, '2 days ago'),
-              ].map((item) {
+                if (uploadedDocumentName != null)
+                  (uploadedDocumentName!, true, _relativeTime(uploadedDocumentAt)),
+                if (lectureActivityTitle != null)
+                  (lectureActivityTitle!, false, _relativeTime(lectureActivityAt)),
+              ].map((item)  {
                 final title = item.$1;
                 final isDoc = item.$2;
                 final time = item.$3;

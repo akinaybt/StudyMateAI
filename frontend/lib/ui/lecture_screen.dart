@@ -10,7 +10,13 @@ import '../services/api_service.dart';
 
 class LectureScreen extends StatefulWidget {
   final VoidCallback onBack;
-  const LectureScreen({super.key, required this.onBack});
+  final VoidCallback onSummaryGenerated;
+
+  const LectureScreen({
+    super.key,
+    required this.onBack,
+    required this.onSummaryGenerated,
+  });
 
   @override
   State<LectureScreen> createState() => _LectureScreenState();
@@ -124,6 +130,7 @@ class _LectureScreenState extends State<LectureScreen> {
         _transcript = result['transcript']?.toString();
         _loading = false;
       });
+      widget.onSummaryGenerated();
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
